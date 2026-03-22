@@ -33,7 +33,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - run: npm install
 
@@ -83,9 +83,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - run: npm install
+
+      - name: Create reports folder
+        run: mkdir -p reports
 
       - name: Run Jest tests
         id: jest
@@ -100,11 +103,9 @@ jobs:
           path: coverage/
           retention-days: 7
 
-      # Capture logs on failure
       - name: Capture failure logs
         if: steps.jest.outcome == 'failure'
         run: |
-          mkdir -p reports
           echo "=== FAILED JOB: Jest Tests ===" > reports/failure-logs.txt
           echo "" >> reports/failure-logs.txt
           cat reports/jest-output.txt >> reports/failure-logs.txt
@@ -145,6 +146,9 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Create reports folder
+        run: mkdir -p reports
+
       - name: Build Docker image
         id: docker-build
         run: |
@@ -168,11 +172,9 @@ jobs:
           path: /tmp/app.tar
           retention-days: 1
 
-      # Capture logs on failure
       - name: Capture failure logs
         if: steps.docker-build.outcome == 'failure'
         run: |
-          mkdir -p reports
           echo "=== FAILED JOB: Docker Build ===" > reports/failure-logs.txt
           echo "" >> reports/failure-logs.txt
           cat reports/docker-build-output.txt >> reports/failure-logs.txt
@@ -323,7 +325,6 @@ jobs:
           echo "EC2 IP: $IP"
 
       - name: SSH deploy
-        id: ssh-deploy
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ steps.get-ip.outputs.ip }}
@@ -364,8 +365,6 @@ jobs:
             echo "Done. Image: $(docker ps --filter name=my-app --format '{{.Image}}')"
 
   # ── 7. Gemini AI — ALL branches, SUCCESS + FAILURE ──────
-  # On SUCCESS → deployment summary + release notes
-  # On FAILURE → error analysis + exact fix suggestions
   ai-summary:
     name: Gemini AI report
     runs-on: ubuntu-latest
@@ -382,14 +381,15 @@ jobs:
 
       - run: pip install google-generativeai
 
-      # Download security report (may not exist if scan didn't run)
+      - name: Create reports folder
+        run: mkdir -p reports
+
       - uses: actions/download-artifact@v4
         with:
           name: security-report
           path: reports/
         continue-on-error: true
 
-      # Download failure logs (may not exist if pipeline passed)
       - uses: actions/download-artifact@v4
         with:
           name: failure-logs
@@ -406,16 +406,15 @@ jobs:
           git diff --name-only HEAD~5 HEAD 2>/dev/null | head -20 >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # Detect which job failed
       - name: Detect failed job
         id: failed-job
         run: |
           FAILED=""
-          [ "${{ needs.lint.result }}"  = "failure" ] && FAILED="Code Quality"
-          [ "${{ needs.test.result }}"  = "failure" ] && FAILED="Jest Tests"
-          [ "${{ needs.build.result }}" = "failure" ] && FAILED="Docker Build"
-          [ "${{ needs.scan.result }}"  = "failure" ] && FAILED="Trivy Security Scan"
-          [ "${{ needs.push.result }}"  = "failure" ] && FAILED="Push to ECR"
+          [ "${{ needs.lint.result }}"   = "failure" ] && FAILED="Code Quality"
+          [ "${{ needs.test.result }}"   = "failure" ] && FAILED="Jest Tests"
+          [ "${{ needs.build.result }}"  = "failure" ] && FAILED="Docker Build"
+          [ "${{ needs.scan.result }}"   = "failure" ] && FAILED="Trivy Security Scan"
+          [ "${{ needs.push.result }}"   = "failure" ] && FAILED="Push to ECR"
           [ "${{ needs.deploy.result }}" = "failure" ] && FAILED="Deploy to EC2"
           echo "failed_job=${FAILED}" >> $GITHUB_OUTPUT
           echo "Detected failed job: ${FAILED:-none}"
