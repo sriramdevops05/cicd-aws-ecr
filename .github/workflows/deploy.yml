@@ -37,6 +37,9 @@ jobs:
 
       - run: npm install
 
+      - name: Create reports folder
+        run: mkdir -p reports
+
       - name: Run ESLint
         id: eslint
         run: npm run lint 2>&1 | tee reports/lint-output.txt
@@ -47,11 +50,9 @@ jobs:
         run: npm run format:check 2>&1 | tee reports/prettier-output.txt
         continue-on-error: true
 
-      # Capture logs on failure for Gemini to analyze
       - name: Capture failure logs
         if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
         run: |
-          mkdir -p reports
           echo "=== FAILED JOB: Code Quality ===" > reports/failure-logs.txt
           echo "" >> reports/failure-logs.txt
           echo "=== ESLint Output ===" >> reports/failure-logs.txt
@@ -68,7 +69,6 @@ jobs:
           path: reports/failure-logs.txt
           retention-days: 7
 
-      # Fail the job after capturing logs
       - name: Fail if lint errors
         if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
         run: exit 1
