@@ -1,0 +1,16 @@
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Remove untagged images after 7 days",
+      "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7 },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 2,
+      "description": "Keep only 5 images per branch",
+      "selection": { "tagStatus": "tagged", "tagPrefixList": ["main-","staging-","feature-"], "countType": "imageCountMoreThan", "countNumber": 5 },
+      "action": { "type": "expire" }
+    }
+  ]
+}
