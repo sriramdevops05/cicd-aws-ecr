@@ -1,215 +1,187 @@
-#!/usr/bin/env python3
-"""
-generate_ai_summary.py
-──────────────────────
-Uses OpenAI GPT-4o to generate:
-  1. A structured deployment summary (Markdown)
-  2. Human-readable release notes
-
-Reads pipeline context from environment variables set by GitHub Actions.
-Outputs two Markdown files to reports/.
-"""
-
 import os
 import sys
 import json
 import datetime
 from pathlib import Path
-from openai import OpenAI
 
-# ── Output directory ────────────────────────────────────────────────────────
 REPORTS_DIR = Path("reports")
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# ── Collect pipeline context ────────────────────────────────────────────────
-def collect_context() -> dict:
-    """Gather all pipeline metadata from environment variables."""
-    security_findings = ""
-    security_path = REPORTS_DIR / "trivy-results.txt"
-    if security_path.exists():
-        content = security_path.read_text()
-        # Limit to first 2000 chars to stay within token budget
-        security_findings = content[:2000] + ("..." if len(content) > 2000 else "")
+
+def collect_context():
+    security_text = ""
+    for fname in ["trivy-report.txt", "reports/trivy-report.txt"]:
+        p = Path(fname)
+        if p.exists():
+            content = p.read_text()
+            security_text = content[:1500] + ("..." if len(content) > 1500 else "")
+            break
+
+    def status_icon(s):
+        return {"success": "✅", "failure": "❌", "skipped": "⏭️"}.get(s, "❓")
+
+    build_s  = os.getenv("STATUS_BUILD",  "unknown")
+    scan_s   = os.getenv("STATUS_SCAN",   "unknown")
+    push_s   = os.getenv("STATUS_PUSH",   "unknown")
+    deploy_s = os.getenv("STATUS_DEPLOY", "unknown")
 
     return {
         "pipeline": {
-            "repository":      os.getenv("REPO", "unknown/repo"),
-            "branch":          os.getenv("BRANCH", "unknown"),
-            "commit_sha":      os.getenv("COMMIT_SHA", "unknown")[:12],
-            "triggered_by":    os.getenv("ACTOR", "unknown"),
-            "run_url":         os.getenv("RUN_URL", "#"),
-            "timestamp":       datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "repo":      os.getenv("REPO",      "unknown"),
+            "branch":    os.getenv("BRANCH",    "unknown"),
+            "sha":       os.getenv("SHORT_SHA", "unknown"),
+            "actor":     os.getenv("ACTOR",     "unknown"),
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         },
-        "job_results": {
-            "build":           os.getenv("PIPELINE_STATUS_BUILD", "unknown"),
-            "security_scan":   os.getenv("PIPELINE_STATUS_SECURITY", "unknown"),
-            "ecr_push":        os.getenv("PIPELINE_STATUS_PUSH", "unknown"),
+        "jobs": {
+            "build":  f"{status_icon(build_s)}  {build_s.upper()}",
+            "scan":   f"{status_icon(scan_s)}   {scan_s.upper()}",
+            "push":   f"{status_icon(push_s)}   {push_s.upper()}",
+            "deploy": f"{status_icon(deploy_s)} {deploy_s.upper()}",
         },
         "image": {
-            "tag":             os.getenv("IMAGE_TAG", "unknown"),
-            "ecr_uri":         os.getenv("ECR_IMAGE_URI", "not-available"),
+            "ecr_uri": os.getenv("ECR_URI", "not-pushed"),
         },
         "changes": {
-            "recent_commits":  os.getenv("COMMIT_MESSAGES", "No commit messages available"),
-            "changed_files":   os.getenv("CHANGED_FILES", "No file changes available"),
+            "commits":       os.getenv("COMMIT_MSGS",   "no commits"),
+            "files_changed": os.getenv("CHANGED_FILES", "no files"),
         },
-        "security_findings":   security_findings or "No security report available.",
+        "security": security_text or "No Trivy report found.",
     }
 
-# ── Build the prompt ────────────────────────────────────────────────────────
-def build_summary_prompt(ctx: dict) -> str:
-    return f"""You are a senior DevOps engineer writing deployment documentation.
-Analyze the following CI/CD pipeline execution and produce a structured deployment summary.
 
-## Pipeline Execution Data
+def build_summary_prompt(ctx):
+    all_success = all("SUCCESS" in v for v in ctx["jobs"].values())
+    overall = "SUCCESS" if all_success else "FAILED"
+    return f"""You are a senior DevOps engineer writing deployment documentation.
+Analyze this CI/CD pipeline execution and write a structured Markdown deployment summary.
+
+## Pipeline Data
 ```json
 {json.dumps(ctx, indent=2)}
 ```
 
-## Instructions
-Write a professional, concise deployment summary in Markdown. Include:
+Write professional Markdown with these sections:
 
-1. **Executive Summary** — 2-3 sentences on overall pipeline outcome.
-2. **Pipeline Status Table** — a table with Job, Status (use), and Notes columns.
-3. **Docker Image Details** — ECR URI, image tag, build timestamp.
-4. **Security Assessment** — brief analysis of Trivy findings; flag CRITICAL/HIGH issues.
-5. **Changes Deployed** — summarize recent commits and changed files in plain English.
-6. **Recommendations** — 2-4 actionable suggestions for the team (e.g., dependency updates, test coverage, security fixes).
-7. **Next Steps** — what automated checks or manual steps should follow.
+# Deployment Summary — {overall}
 
-Keep the tone professional but developer-friendly. Use emoji sparingly. Output only the Markdown, no preamble.
-"""
+## Executive Summary
+2-3 sentence high-level outcome.
 
-def build_release_notes_prompt(ctx: dict) -> str:
-    return f"""You are a technical writer generating release notes for an engineering team.
+## Pipeline Status
+A Markdown table: Job | Status | Notes
 
-## Commit Messages (last 10)
-{ctx['changes']['recent_commits']}
+## Image Details
+ECR URI, short SHA, timestamp.
 
-## Changed Files
-{ctx['changes']['changed_files']}
+## Security Assessment
+Brief summary of Trivy findings. Call out CRITICAL/HIGH if present.
+
+## Changes Deployed
+Plain-English summary of the commits and files changed.
+
+## Recommendations
+2-3 concrete actionable suggestions.
+
+Output ONLY the Markdown, no preamble."""
+
+
+def build_release_notes_prompt(ctx):
+    return f"""You are a technical writer generating release notes.
+
+## Recent commits
+{ctx['changes']['commits']}
+
+## Changed files
+{ctx['changes']['files_changed']}
 
 ## Image
 {ctx['image']['ecr_uri']}
 
-## Instructions
-Generate clear, user-friendly release notes in Markdown. Structure:
+## Timestamp
+{ctx['pipeline']['timestamp']}
 
-### What's New
-- Bullet list of new features or improvements inferred from commits.
+Write clean Markdown release notes with these sections:
+- What's new
+- Bug fixes (omit if none)
+- Infrastructure/CI changes
+- Breaking changes (write "None" if none)
+- Deployment metadata (image URI, SHA, timestamp)
 
-### Bug Fixes
-- Bullet list of bug fixes (if any, otherwise omit section).
+Output ONLY the Markdown, no preamble."""
 
-### Internal / Infrastructure Changes
-- Bullet list of infra, CI/CD, or dependency changes.
 
-###Breaking Changes
-- Any breaking changes (if none, say "None").
-
-###Deployment
-- Docker image: `{ctx['image']['ecr_uri']}`
-- Deployed at: `{ctx['pipeline']['timestamp']}`
-- Commit: `{ctx['pipeline']['commit_sha']}`
-
-Keep it concise. Infer intent from commit messages. Output only the Markdown, no preamble.
-"""
-
-# ── Call OpenAI ──────────────────────────────────────────────────────────────
-def call_openai(client: OpenAI, prompt: str, label: str) -> str:
-    print(f"Generating {label}...")
+def call_gemini(api_key, prompt, label):
+    import google.generativeai as genai
+    print(f"Calling Gemini for: {label}")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert DevOps engineer and technical writer. "
-                        "You produce clear, accurate, and actionable documentation. "
-                        "Always output valid Markdown."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=1500,
-            temperature=0.3,  # Lower temperature → more deterministic/professional output
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=1500,
+            ),
         )
-        content = response.choices[0].message.content
-        print(f" {label} generated ({len(content)} chars)")
-        return content
+        print(f"  Done: {label} ({len(response.text)} chars)")
+        return response.text
     except Exception as e:
-        print(f" Failed to generate {label}: {e}", file=sys.stderr)
-        return f"## AI Summary Unavailable\n\nError: `{e}`\n"
+        print(f"  Error: {e}", file=sys.stderr)
+        return f"## AI generation failed\n\nError: `{e}`\n"
 
-# ── Write header ─────────────────────────────────────────────────────────────
-def write_header(ctx: dict) -> str:
-    status_emoji = {
-        "success": "",
-        "failure": "",
-        "skipped": "",
-        "unknown": "",
-    }
-    build_icon   = status_emoji.get(ctx["job_results"]["build"],         "")
-    sec_icon     = status_emoji.get(ctx["job_results"]["security_scan"], "")
-    push_icon    = status_emoji.get(ctx["job_results"]["ecr_push"],      "")
-    overall = "SUCCESS" if all(
-        v == "success" for v in ctx["job_results"].values()
-    ) else "FAILED"
 
-    return f"""#AI Deployment Summary — {overall}
+def write_header(ctx):
+    all_success = all("SUCCESS" in v for v in ctx["jobs"].values())
+    badge = "ALL JOBS PASSED" if all_success else "PIPELINE FAILED"
+    return f"""# AI Deployment Report — {badge}
 
-> **Generated by GPT-4o** | {ctx['pipeline']['timestamp']}
-> **Run:** [{ctx['pipeline']['repository']}]({ctx['pipeline']['run_url']}) · `{ctx['pipeline']['branch']}` · `{ctx['pipeline']['commit_sha']}`
+> Generated by Google Gemini 1.5 Flash (FREE) | {ctx['pipeline']['timestamp']}
+> Repo: `{ctx['pipeline']['repo']}` · Branch: `{ctx['pipeline']['branch']}` · SHA: `{ctx['pipeline']['sha']}`
 
 | Job | Status |
 |-----|--------|
-| Docker Build | {build_icon} {ctx['job_results']['build'].upper()} |
-| Security Scan | {sec_icon} {ctx['job_results']['security_scan'].upper()} |
-| ECR Push | {push_icon} {ctx['job_results']['ecr_push'].upper()} |
+| Docker Build | {ctx['jobs']['build']} |
+| Security Scan | {ctx['jobs']['scan']} |
+| Push to ECR | {ctx['jobs']['push']} |
+| Deploy to EC2 | {ctx['jobs']['deploy']} |
 
 ---
 
 """
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("OPENAI_API_KEY not set. Skipping AI summary generation.", file=sys.stderr)
-        fallback = "## AI Summary Unavailable\n\nOPENAI_API_KEY secret is not configured.\n"
+        print("GEMINI_API_KEY not set — writing fallback report.", file=sys.stderr)
+        fallback = (
+            "## AI Summary Unavailable\n\n"
+            "Add `GEMINI_API_KEY` to your GitHub Secrets.\n"
+            "Get a free key at: https://aistudio.google.com/app/apikey\n"
+        )
         (REPORTS_DIR / "ai-summary.md").write_text(fallback)
         (REPORTS_DIR / "release-notes.md").write_text(fallback)
-        sys.exit(0)  # Don't fail the pipeline for missing AI key
+        sys.exit(0)
 
-    client = OpenAI(api_key=api_key)
     ctx = collect_context()
+    print(f"Repo:   {ctx['pipeline']['repo']}")
+    print(f"Branch: {ctx['pipeline']['branch']}")
+    print(f"SHA:    {ctx['pipeline']['sha']}")
 
-    print("📋 Pipeline context collected:")
-    print(f"   Repo:   {ctx['pipeline']['repository']}")
-    print(f"   Branch: {ctx['pipeline']['branch']}")
-    print(f"   Commit: {ctx['pipeline']['commit_sha']}")
-    print(f"   Jobs:   {ctx['job_results']}")
-
-    # Generate both documents
     header       = write_header(ctx)
-    summary_body = call_openai(client, build_summary_prompt(ctx),        "Deployment Summary")
-    release_body = call_openai(client, build_release_notes_prompt(ctx),  "Release Notes")
+    summary_body = call_gemini(api_key, build_summary_prompt(ctx),       "Deployment Summary")
+    release_body = call_gemini(api_key, build_release_notes_prompt(ctx), "Release Notes")
 
-    # Write outputs
-    summary_path      = REPORTS_DIR / "ai-summary.md"
-    release_path      = REPORTS_DIR / "release-notes.md"
-
-    summary_path.write_text(header + summary_body)
-    release_path.write_text(
+    (REPORTS_DIR / "ai-summary.md").write_text(header + summary_body)
+    (REPORTS_DIR / "release-notes.md").write_text(
         f"# Release Notes\n\n"
-        f"> Commit `{ctx['pipeline']['commit_sha']}` · {ctx['pipeline']['timestamp']}\n\n"
+        f"> SHA `{ctx['pipeline']['sha']}` · {ctx['pipeline']['timestamp']}\n\n"
         + release_body
     )
 
-    print(f"\nReports written:")
-    print(f"   {summary_path}")
-    print(f"   {release_path}")
+    print("Reports written to reports/ai-summary.md and reports/release-notes.md")
+
 
 if __name__ == "__main__":
     main()
