@@ -21,6 +21,7 @@ env:
   ECR_REPOSITORY: my-app
   APP_PORT: 3000
   EC2_USER: ec2-user
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
 
