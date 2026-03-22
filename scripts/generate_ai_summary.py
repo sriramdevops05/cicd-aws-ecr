@@ -17,6 +17,14 @@ def collect_context():
             security_text = content[:1500] + ("..." if len(content) > 1500 else "")
             break
 
+    failure_logs = ""
+    for fname in ["failure-logs.txt", "reports/failure-logs.txt"]:
+        p = Path(fname)
+        if p.exists():
+            content = p.read_text()
+            failure_logs = content[:3000] + ("..." if len(content) > 3000 else "")
+            break
+
     def status_icon(s):
         return {"success": "✅", "failure": "❌", "skipped": "⏭️"}.get(s, "❓")
 
@@ -24,6 +32,9 @@ def collect_context():
     scan_s   = os.getenv("STATUS_SCAN",   "unknown")
     push_s   = os.getenv("STATUS_PUSH",   "unknown")
     deploy_s = os.getenv("STATUS_DEPLOY", "unknown")
+
+    all_statuses = [build_s, scan_s, push_s, deploy_s]
+    pipeline_failed = any(s == "failure" for s in all_statuses)
 
     return {
         "pipeline": {
@@ -39,6 +50,15 @@ def collect_context():
             "push":   f"{status_icon(push_s)}   {push_s.upper()}",
             "deploy": f"{status_icon(deploy_s)} {deploy_s.upper()}",
         },
+        "raw_statuses": {
+            "build":  build_s,
+            "scan":   scan_s,
+            "push":   push_s,
+            "deploy": deploy_s,
+        },
+        "pipeline_failed": pipeline_failed,
+        "failed_job": os.getenv("FAILED_JOB", ""),
+        "failure_logs": failure_logs,
         "image": {
             "ecr_uri": os.getenv("ECR_URI", "not-pushed"),
         },
@@ -50,11 +70,67 @@ def collect_context():
     }
 
 
+# ── FAILURE ANALYSIS PROMPT ──────────────────────────────────────────────────
+def build_failure_prompt(ctx):
+    return f"""You are a senior DevOps engineer and CI/CD expert.
+A GitHub Actions pipeline has FAILED. Analyze the error logs and provide an exact fix.
+
+## Pipeline Context
+```json
+{json.dumps({
+    "repo":       ctx["pipeline"]["repo"],
+    "branch":     ctx["pipeline"]["branch"],
+    "sha":        ctx["pipeline"]["sha"],
+    "failed_job": ctx["failed_job"],
+    "job_statuses": ctx["jobs"],
+}, indent=2)}
+```
+
+## Error Logs
+```
+{ctx["failure_logs"] or "No logs captured — check GitHub Actions tab manually."}
+```
+
+## Recent Commits
+{ctx["changes"]["commits"]}
+
+## Changed Files
+{ctx["changes"]["files_changed"]}
+
+Write a clear Markdown failure report with EXACTLY these sections:
+
+# Pipeline Failure Report
+
+## What Failed
+One sentence — which job failed and what the error is.
+
+## Root Cause
+2-3 sentences explaining WHY it failed in plain English.
+
+## Exact Fix
+Step-by-step instructions to fix it. Be very specific — show exact file names,
+exact code to change, exact commands to run. Format as numbered steps.
+
+## Code Change Required
+If a file needs editing, show the exact before and after:
+```
+BEFORE:
+<old code>
+
+AFTER:
+<new code>
+```
+
+## Prevention
+1-2 sentences on how to prevent this error in the future.
+
+Be direct and specific. A junior developer should be able to fix it by following your steps."""
+
+
+# ── SUCCESS SUMMARY PROMPT ───────────────────────────────────────────────────
 def build_summary_prompt(ctx):
-    all_success = all("SUCCESS" in v for v in ctx["jobs"].values())
-    overall = "SUCCESS" if all_success else "FAILED"
     return f"""You are a senior DevOps engineer writing deployment documentation.
-Analyze this CI/CD pipeline execution and write a structured Markdown deployment summary.
+Analyze this successful CI/CD pipeline and write a structured Markdown deployment summary.
 
 ## Pipeline Data
 ```json
@@ -63,7 +139,7 @@ Analyze this CI/CD pipeline execution and write a structured Markdown deployment
 
 Write professional Markdown with these sections:
 
-# Deployment Summary — {overall}
+# Deployment Summary — SUCCESS
 
 ## Executive Summary
 2-3 sentence high-level outcome.
@@ -86,6 +162,7 @@ Plain-English summary of the commits and files changed.
 Output ONLY the Markdown, no preamble."""
 
 
+# ── RELEASE NOTES PROMPT ─────────────────────────────────────────────────────
 def build_release_notes_prompt(ctx):
     return f"""You are a technical writer generating release notes.
 
@@ -111,6 +188,7 @@ Write clean Markdown release notes with these sections:
 Output ONLY the Markdown, no preamble."""
 
 
+# ── CALL GEMINI ──────────────────────────────────────────────────────────────
 def call_gemini(api_key, prompt, label):
     import google.generativeai as genai
     print(f"Calling Gemini for: {label}")
@@ -121,29 +199,32 @@ def call_gemini(api_key, prompt, label):
             prompt,
             generation_config=genai.types.GenerationConfig(
                 temperature=0.3,
-                max_output_tokens=1500,
+                max_output_tokens=2000,
             ),
         )
         print(f"  Done: {label} ({len(response.text)} chars)")
         return response.text
     except Exception as e:
-        print(f"  Error: {e}", file=sys.stderr)
+        print(f"  Error calling Gemini: {e}", file=sys.stderr)
         return f"## AI generation failed\n\nError: `{e}`\n"
 
 
+# ── HEADER ───────────────────────────────────────────────────────────────────
 def write_header(ctx):
-    all_success = all("SUCCESS" in v for v in ctx["jobs"].values())
-    badge = "ALL JOBS PASSED" if all_success else "PIPELINE FAILED"
-    return f"""# AI Deployment Report — {badge}
+    failed = ctx["pipeline_failed"]
+    badge  = "PIPELINE FAILED" if failed else "ALL JOBS PASSED"
+    icon   = "FAILURE ANALYSIS" if failed else "DEPLOYMENT REPORT"
+
+    return f"""# AI {icon} — {badge}
 
 > Generated by Google Gemini 1.5 Flash (FREE) | {ctx['pipeline']['timestamp']}
 > Repo: `{ctx['pipeline']['repo']}` · Branch: `{ctx['pipeline']['branch']}` · SHA: `{ctx['pipeline']['sha']}`
 
 | Job | Status |
 |-----|--------|
-| Docker Build | {ctx['jobs']['build']} |
+| Docker Build  | {ctx['jobs']['build']} |
 | Security Scan | {ctx['jobs']['scan']} |
-| Push to ECR | {ctx['jobs']['push']} |
+| Push to ECR   | {ctx['jobs']['push']} |
 | Deploy to EC2 | {ctx['jobs']['deploy']} |
 
 ---
@@ -151,6 +232,7 @@ def write_header(ctx):
 """
 
 
+# ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -165,22 +247,42 @@ def main():
         sys.exit(0)
 
     ctx = collect_context()
-    print(f"Repo:   {ctx['pipeline']['repo']}")
-    print(f"Branch: {ctx['pipeline']['branch']}")
-    print(f"SHA:    {ctx['pipeline']['sha']}")
+    print(f"Repo:           {ctx['pipeline']['repo']}")
+    print(f"Branch:         {ctx['pipeline']['branch']}")
+    print(f"SHA:            {ctx['pipeline']['sha']}")
+    print(f"Pipeline failed:{ctx['pipeline_failed']}")
+    print(f"Failed job:     {ctx['failed_job'] or 'none'}")
 
-    header       = write_header(ctx)
-    summary_body = call_gemini(api_key, build_summary_prompt(ctx),       "Deployment Summary")
-    release_body = call_gemini(api_key, build_release_notes_prompt(ctx), "Release Notes")
+    header = write_header(ctx)
 
-    (REPORTS_DIR / "ai-summary.md").write_text(header + summary_body)
-    (REPORTS_DIR / "release-notes.md").write_text(
-        f"# Release Notes\n\n"
-        f"> SHA `{ctx['pipeline']['sha']}` · {ctx['pipeline']['timestamp']}\n\n"
-        + release_body
-    )
+    if ctx["pipeline_failed"]:
+        # ── FAILURE MODE — analyze and suggest fix ──
+        print("Pipeline FAILED — generating failure analysis...")
+        failure_body = call_gemini(api_key, build_failure_prompt(ctx), "Failure Analysis")
 
-    print("Reports written to reports/ai-summary.md and reports/release-notes.md")
+        (REPORTS_DIR / "ai-summary.md").write_text(header + failure_body)
+        (REPORTS_DIR / "release-notes.md").write_text(
+            f"# Release Notes\n\n> Pipeline failed — no release notes generated.\n\n"
+            f"Fix the pipeline failure first, then re-run.\n\n"
+            f"Failed job: `{ctx['failed_job']}`\n"
+            f"SHA: `{ctx['pipeline']['sha']}`\n"
+        )
+        print("Failure analysis written to reports/ai-summary.md")
+
+    else:
+        # ── SUCCESS MODE — deployment summary + release notes ──
+        print("Pipeline PASSED — generating deployment summary...")
+        summary_body = call_gemini(api_key, build_summary_prompt(ctx),      "Deployment Summary")
+        release_body = call_gemini(api_key, build_release_notes_prompt(ctx), "Release Notes")
+
+        (REPORTS_DIR / "ai-summary.md").write_text(header + summary_body)
+        (REPORTS_DIR / "release-notes.md").write_text(
+            f"# Release Notes\n\n"
+            f"> SHA `{ctx['pipeline']['sha']}` · {ctx['pipeline']['timestamp']}\n\n"
+            + release_body
+        )
+        print("Deployment summary written to reports/ai-summary.md")
+        print("Release notes written to reports/release-notes.md")
 
 
 if __name__ == "__main__":

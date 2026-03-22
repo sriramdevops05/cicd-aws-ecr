@@ -36,8 +36,42 @@ jobs:
           node-version: "20"
 
       - run: npm install
-      - run: npm run lint
-      - run: npm run format:check
+
+      - name: Run ESLint
+        id: eslint
+        run: npm run lint 2>&1 | tee reports/lint-output.txt
+        continue-on-error: true
+
+      - name: Run Prettier
+        id: prettier
+        run: npm run format:check 2>&1 | tee reports/prettier-output.txt
+        continue-on-error: true
+
+      # Capture logs on failure for Gemini to analyze
+      - name: Capture failure logs
+        if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
+        run: |
+          mkdir -p reports
+          echo "=== FAILED JOB: Code Quality ===" > reports/failure-logs.txt
+          echo "" >> reports/failure-logs.txt
+          echo "=== ESLint Output ===" >> reports/failure-logs.txt
+          cat reports/lint-output.txt >> reports/failure-logs.txt
+          echo "" >> reports/failure-logs.txt
+          echo "=== Prettier Output ===" >> reports/failure-logs.txt
+          cat reports/prettier-output.txt >> reports/failure-logs.txt
+
+      - name: Upload failure logs
+        if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: reports/failure-logs.txt
+          retention-days: 7
+
+      # Fail the job after capturing logs
+      - name: Fail if lint errors
+        if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
+        run: exit 1
 
   # ── 2. Test — ALL branches ───────────────────────────────
   test:
@@ -53,7 +87,10 @@ jobs:
 
       - run: npm install
 
-      - run: npm run test:coverage
+      - name: Run Jest tests
+        id: jest
+        run: npm run test:coverage 2>&1 | tee reports/jest-output.txt
+        continue-on-error: true
         env:
           CI: true
 
@@ -63,8 +100,29 @@ jobs:
           path: coverage/
           retention-days: 7
 
+      # Capture logs on failure
+      - name: Capture failure logs
+        if: steps.jest.outcome == 'failure'
+        run: |
+          mkdir -p reports
+          echo "=== FAILED JOB: Jest Tests ===" > reports/failure-logs.txt
+          echo "" >> reports/failure-logs.txt
+          cat reports/jest-output.txt >> reports/failure-logs.txt
+
+      - name: Upload failure logs
+        if: steps.jest.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: reports/failure-logs.txt
+          retention-days: 7
+
+      - name: Fail if tests failed
+        if: steps.jest.outcome == 'failure'
+        run: exit 1
+
       - name: PR coverage comment
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.jest.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -87,25 +145,49 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          tags: local/app:scan
-          outputs: type=docker,dest=/tmp/app.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            NODE_ENV=production
+      - name: Build Docker image
+        id: docker-build
+        run: |
+          docker buildx build \
+            --build-arg BUILD_VERSION=${{ github.sha }} \
+            --build-arg BUILD_DATE=${{ github.event.head_commit.timestamp }} \
+            --build-arg NODE_ENV=production \
+            -t local/app:scan \
+            --output type=docker \
+            . 2>&1 | tee reports/docker-build-output.txt
+        continue-on-error: true
+
+      - name: Save image to tar
+        if: steps.docker-build.outcome == 'success'
+        run: docker save local/app:scan -o /tmp/app.tar
 
       - uses: actions/upload-artifact@v4
+        if: steps.docker-build.outcome == 'success'
         with:
           name: docker-image
           path: /tmp/app.tar
           retention-days: 1
+
+      # Capture logs on failure
+      - name: Capture failure logs
+        if: steps.docker-build.outcome == 'failure'
+        run: |
+          mkdir -p reports
+          echo "=== FAILED JOB: Docker Build ===" > reports/failure-logs.txt
+          echo "" >> reports/failure-logs.txt
+          cat reports/docker-build-output.txt >> reports/failure-logs.txt
+
+      - name: Upload failure logs
+        if: steps.docker-build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: reports/failure-logs.txt
+          retention-days: 7
+
+      - name: Fail if build failed
+        if: steps.docker-build.outcome == 'failure'
+        run: exit 1
 
   # ── 4. Security scan — ALL branches ─────────────────────
   scan:
@@ -151,7 +233,6 @@ jobs:
           retention-days: 30
 
   # ── 5. Push to ECR — ALL branches ───────────────────────
-  # Tags image as branch-latest on feature, latest on main
   push:
     name: Push to ECR
     runs-on: ubuntu-latest
@@ -194,13 +275,11 @@ jobs:
           BRANCH="${GITHUB_REF_NAME//\//-}"
           FULL="${REGISTRY}/${ECR_REPOSITORY}"
 
-          # Always push with SHA and branch tag
           docker tag local/app:scan "${FULL}:${SHA}"
           docker tag local/app:scan "${FULL}:${BRANCH}-latest"
           docker push "${FULL}:${SHA}"
           docker push "${FULL}:${BRANCH}-latest"
 
-          # Only tag as latest on main
           if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             docker tag local/app:scan "${FULL}:latest"
             docker push "${FULL}:latest"
@@ -208,7 +287,7 @@ jobs:
 
           echo "ecr_uri=${FULL}:${SHA}" >> $GITHUB_OUTPUT
           echo "short_sha=${SHA}" >> $GITHUB_OUTPUT
-          echo "Branch: ${BRANCH} — Pushed: ${FULL}:${SHA}"
+          echo "Pushed: ${FULL}:${SHA}"
 
       - name: Apply lifecycle policy
         run: |
@@ -244,6 +323,7 @@ jobs:
           echo "EC2 IP: $IP"
 
       - name: SSH deploy
+        id: ssh-deploy
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ steps.get-ip.outputs.ip }}
@@ -283,13 +363,14 @@ jobs:
             docker image prune -af --filter "until=24h"
             echo "Done. Image: $(docker ps --filter name=my-app --format '{{.Image}}')"
 
-  # ── 7. Gemini AI report — ALL branches ──────────────────
-  # Runs always — even when deploy is skipped on feature branches
+  # ── 7. Gemini AI — ALL branches, SUCCESS + FAILURE ──────
+  # On SUCCESS → deployment summary + release notes
+  # On FAILURE → error analysis + exact fix suggestions
   ai-summary:
     name: Gemini AI report
     runs-on: ubuntu-latest
-    needs: [scan, push, deploy]
-    if: always() && needs.scan.result == 'success' && needs.push.result == 'success'
+    needs: [lint, test, build, scan, push, deploy]
+    if: always()
     steps:
       - uses: actions/checkout@v4
         with:
@@ -301,9 +382,17 @@ jobs:
 
       - run: pip install google-generativeai
 
+      # Download security report (may not exist if scan didn't run)
       - uses: actions/download-artifact@v4
         with:
           name: security-report
+          path: reports/
+        continue-on-error: true
+
+      # Download failure logs (may not exist if pipeline passed)
+      - uses: actions/download-artifact@v4
+        with:
+          name: failure-logs
           path: reports/
         continue-on-error: true
 
@@ -316,6 +405,20 @@ jobs:
           echo "files<<EOF" >> $GITHUB_OUTPUT
           git diff --name-only HEAD~5 HEAD 2>/dev/null | head -20 >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
+      # Detect which job failed
+      - name: Detect failed job
+        id: failed-job
+        run: |
+          FAILED=""
+          [ "${{ needs.lint.result }}"  = "failure" ] && FAILED="Code Quality"
+          [ "${{ needs.test.result }}"  = "failure" ] && FAILED="Jest Tests"
+          [ "${{ needs.build.result }}" = "failure" ] && FAILED="Docker Build"
+          [ "${{ needs.scan.result }}"  = "failure" ] && FAILED="Trivy Security Scan"
+          [ "${{ needs.push.result }}"  = "failure" ] && FAILED="Push to ECR"
+          [ "${{ needs.deploy.result }}" = "failure" ] && FAILED="Deploy to EC2"
+          echo "failed_job=${FAILED}" >> $GITHUB_OUTPUT
+          echo "Detected failed job: ${FAILED:-none}"
 
       - name: Generate AI report
         env:
@@ -331,6 +434,7 @@ jobs:
           REPO:          ${{ github.repository }}
           COMMIT_MSGS:   ${{ steps.ctx.outputs.commits }}
           CHANGED_FILES: ${{ steps.ctx.outputs.files }}
+          FAILED_JOB:    ${{ steps.failed-job.outputs.failed_job }}
         run: python scripts/generate_ai_summary.py
 
       - uses: actions/upload-artifact@v4
