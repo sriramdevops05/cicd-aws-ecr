@@ -14,7 +14,7 @@ WORKDIR /app
 
 # Production dependencies only
 COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
 
 # Copy app source + static files
 COPY --chown=appuser:appgroup app/ ./app/
