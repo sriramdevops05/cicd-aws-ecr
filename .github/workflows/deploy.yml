@@ -306,7 +306,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment:
       name: production
-      url: http://${{ secrets.EC2_HOST }}:3000
+      url: http://${{ steps.get-ip.outputs.ip }}:3000
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
