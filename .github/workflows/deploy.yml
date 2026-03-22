@@ -1,0 +1,302 @@
+name: CI/CD — Build Test Deploy Web App
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: my-app
+  APP_PORT: 3000
+  EC2_USER: ec2-user
+
+jobs:
+
+  # ── 1. Lint ──────────────────────────────────────────────
+  lint:
+    name: Code quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: "npm" }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+
+  # ── 2. Test ──────────────────────────────────────────────
+  test:
+    name: Jest tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: "npm" }
+      - run: npm ci
+      - run: npm run test:coverage
+        env: { CI: true }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+      - name: PR coverage comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('coverage/coverage-summary.json')) return;
+            const { total: t } = JSON.parse(fs.readFileSync('coverage/coverage-summary.json'));
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo,
+              body: `## Test Coverage\n| Metric | % |\n|---|---|\n| Statements | ${t.statements.pct}% |\n| Branches | ${t.branches.pct}% |\n| Functions | ${t.functions.pct}% |\n| Lines | ${t.lines.pct}% |`
+            });
+
+  # ── 3. Build Docker image ────────────────────────────────
+  build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: local/app:scan
+          outputs: type=docker,dest=/tmp/app.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            NODE_ENV=production
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/app.tar
+          retention-days: 1
+
+  # ── 4. Security scan ─────────────────────────────────────
+  scan:
+    name: Trivy security scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: docker-image, path: /tmp }
+      - run: docker load -i /tmp/app.tar
+      - name: Trivy SARIF
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: local/app:scan
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: trivy.sarif }
+      - name: Trivy readable report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: local/app:scan
+          format: table
+          output: trivy-report.txt
+          severity: CRITICAL,HIGH,MEDIUM
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: trivy-report.txt
+          retention-days: 30
+
+  # ── 5. Push to AWS ECR ───────────────────────────────────
+  push:
+    name: Push to ECR
+    runs-on: ubuntu-latest
+    needs: scan
+    if: github.event_name != 'pull_request'
+    outputs:
+      ecr_uri: ${{ steps.push.outputs.ecr_uri }}
+      short_sha: ${{ steps.push.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Ensure ECR repo exists
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name $ECR_REPOSITORY \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+      - uses: actions/download-artifact@v4
+        with: { name: docker-image, path: /tmp }
+      - name: Tag and push
+        id: push
+        env:
+          REGISTRY: ${{ steps.login.outputs.registry }}
+        run: |
+          docker load -i /tmp/app.tar
+          SHA="${GITHUB_SHA:0:8}"
+          FULL="${REGISTRY}/${ECR_REPOSITORY}"
+          docker tag local/app:scan "${FULL}:${SHA}"
+          docker tag local/app:scan "${FULL}:latest"
+          docker push "${FULL}:${SHA}"
+          docker push "${FULL}:latest"
+          echo "ecr_uri=${FULL}:${SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "Pushed: ${FULL}:${SHA}"
+      - name: Apply lifecycle policy
+        run: |
+          aws ecr put-lifecycle-policy \
+            --repository-name $ECR_REPOSITORY \
+            --lifecycle-policy-text file://ecr/lifecycle-policy.json
+
+  # ── 6. Deploy to EC2 via SSH ─────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: push
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: http://${{ steps.get-ip.outputs.ip }}:3000
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Get EC2 IP
+        id: get-ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=cicd-demo-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          echo "ip=${IP}" >> $GITHUB_OUTPUT
+          echo "EC2 IP: $IP"
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.get-ip.outputs.ip }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            # Auth Docker with ECR using instance role
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin \
+              $(echo "${{ needs.push.outputs.ecr_uri }}" | cut -d/ -f1)
+
+            echo "Pulling ${{ needs.push.outputs.ecr_uri }}"
+            docker pull ${{ needs.push.outputs.ecr_uri }}
+
+            # Stop old container
+            docker stop my-app 2>/dev/null || true
+            docker rm   my-app 2>/dev/null || true
+
+            # Run new container
+            docker run -d \
+              --name my-app \
+              --restart unless-stopped \
+              -p ${{ env.APP_PORT }}:${{ env.APP_PORT }} \
+              -e NODE_ENV=production \
+              -e BUILD_VERSION=${{ needs.push.outputs.short_sha }} \
+              --health-cmd="wget -qO- http://localhost:${{ env.APP_PORT }}/health || exit 1" \
+              --health-interval=30s \
+              --health-timeout=10s \
+              --health-retries=3 \
+              ${{ needs.push.outputs.ecr_uri }}
+
+            # Wait for healthy
+            echo "Waiting for health check..."
+            for i in $(seq 1 15); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' my-app 2>/dev/null || echo "starting")
+              echo "  $i/15: $STATUS"
+              [ "$STATUS" = "healthy" ] && echo "Healthy!" && break
+              sleep 4
+            done
+
+            docker image prune -af --filter "until=24h"
+            echo "Done. Image: $(docker ps --filter name=my-app --format '{{.Image}}')"
+
+  # ── 7. Gemini AI summary ────────────────────────────────
+  ai-summary:
+    name: Gemini AI report
+    runs-on: ubuntu-latest
+    needs: [scan, push, deploy]
+    if: always() && github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install google-generativeai
+      - uses: actions/download-artifact@v4
+        with: { name: security-report, path: reports/ }
+        continue-on-error: true
+      - name: Gather context
+        id: ctx
+        run: |
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          git log --oneline -10 --no-merges >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only HEAD~5 HEAD 2>/dev/null | head -20 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Generate AI report
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          STATUS_BUILD:  ${{ needs.build.result }}
+          STATUS_SCAN:   ${{ needs.scan.result }}
+          STATUS_PUSH:   ${{ needs.push.result }}
+          STATUS_DEPLOY: ${{ needs.deploy.result }}
+          ECR_URI:       ${{ needs.push.outputs.ecr_uri }}
+          SHORT_SHA:     ${{ needs.push.outputs.short_sha }}
+          BRANCH:        ${{ github.ref_name }}
+          ACTOR:         ${{ github.actor }}
+          REPO:          ${{ github.repository }}
+          COMMIT_MSGS:   ${{ steps.ctx.outputs.commits }}
+          CHANGED_FILES: ${{ steps.ctx.outputs.files }}
+        run: python scripts/generate_ai_summary.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-reports
+          path: reports/
+          retention-days: 90
+      - name: Post to Step Summary
+        if: always()
+        run: '[ -f reports/ai-summary.md ] && cat reports/ai-summary.md >> $GITHUB_STEP_SUMMARY || true'
+      - name: Post as commit comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.existsSync('reports/ai-summary.md')
+              ? fs.readFileSync('reports/ai-summary.md', 'utf8').slice(0, 65000)
+              : '## AI Summary unavailable — add GEMINI_API_KEY secret';
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              commit_sha: context.sha, body
+            });
