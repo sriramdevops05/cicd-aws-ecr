@@ -36,7 +36,7 @@ jobs:
         with:
           node-version: "22"
 
-      - run: /*npm install*/
+      - run: npm install
 
       - name: Create reports folder
         run: mkdir -p reports
